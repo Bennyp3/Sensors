@@ -1,0 +1,16 @@
+# Ignore all PDFs
+*.pdf
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# OS junk files
+.DS_Store
+Thumbs.db
+
+# Word temporary lock files
+~$*.docx
+
+# Secrets
+secrets.py
