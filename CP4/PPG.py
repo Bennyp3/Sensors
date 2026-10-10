@@ -3,20 +3,24 @@ import time
 
 ppg = ADC(Pin(26))       # GP26 (Pin 31)
 
-SAMPLE_MS = 4            # sample at 250 Hz for accurate beat timing
-PLOT_EVERY = 5           # plot 1 point per 5 samples -> 5x more time on screen
-SHOW_WAVE = True         # True = waveform in Plotter, False = BPM text every 5 s
-WINDOW_MS = 5000         # report BPM every 5 seconds
+SAMPLE_MS = 4            # 250 Hz sampling
+PLOT_EVERY = 15          # ~17 points/s on the plotter
+SHOW_WAVE = False        # False = BPM only (easy to read), True = waveform too
+REPORT_MS = 2000         # print BPM every 2 seconds
+WINDOW_MS = 6000         # use the last 6 s of beats (~7 beats) for each BPM
 
+# Kalman filter on BPM
+EST = None               # current estimate (set from first reading)
+E_EST = 10.0             # starting error in the estimate (BPM)
+E_MEA = 5.0              # measurement error (BPM): how noisy raw readings are
+Q = 1.0                  # process noise: how much true HR can drift per update
 
 def read_ppg():
-    """Return a 12-bit PPG sample (0-4095)."""
-    return ppg.read_u16() >> 4
-
+    return ppg.read_u16() >> 4   # 12-bit (0-4095)
 
 high = low = read_ppg()
 above = False
-beats = []               # times of detected beats (ms)
+beats = []
 last_report = time.ticks_ms()
 total = count = 0
 
@@ -24,7 +28,7 @@ while True:
     sample = read_ppg()
     now = time.ticks_ms()
 
-    # --- Beat detection (adaptive threshold, same as before) ---
+    # adaptive threshold beat detection
     high = max(sample, high - 1)
     low = min(sample, low + 1)
     threshold = low + 0.6 * (high - low)
@@ -35,7 +39,7 @@ while True:
     elif sample < threshold:
         above = False
 
-    # --- Plot: average groups of samples ---
+    # waveform output (decimated)
     total += sample
     count += 1
     if count == PLOT_EVERY:
@@ -43,18 +47,24 @@ while True:
             print(total // count)
         total = count = 0
 
-    # --- BPM every 5 seconds, from the median beat-to-beat interval ---
-    if time.ticks_diff(now, last_report) >= WINDOW_MS:
+    # BPM + Kalman filter every 2 s
+    if time.ticks_diff(now, last_report) >= REPORT_MS:
         beats = [t for t in beats if time.ticks_diff(now, t) <= WINDOW_MS]
         intervals = [time.ticks_diff(b, a) for a, b in zip(beats, beats[1:])]
         intervals = [i for i in intervals if 300 < i < 2000]
-        if not SHOW_WAVE:
-            if len(intervals) >= 2:
-                intervals.sort()
-                median = intervals[len(intervals) // 2]
-                print("BPM:", round(60000 / median), "(", len(intervals) + 1, "beats )")
+        if len(intervals) >= 2:
+            intervals.sort()
+            raw = 60000 / intervals[len(intervals) // 2]
+            if EST is None:
+                EST = raw                          # first reading starts the filter
             else:
-                print("BPM: -- (not enough clean beats yet)")
+                E_EST += Q                         # predict: allow HR to drift
+                KG = E_EST / (E_EST + E_MEA)       # Kalman gain
+                EST = EST + KG * (raw - EST)       # update estimate
+                E_EST = (1 - KG) * E_EST           # update estimate error
+            print("BPM raw:", round(raw), "  KF:", round(EST))
+        else:
+            print("BPM: --")
         last_report = now
 
     time.sleep_ms(SAMPLE_MS)
