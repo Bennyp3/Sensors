@@ -8,9 +8,9 @@ Capacitive press detector (CP4).
   ~220 us hard center.
 
 A PIO state machine makes each rising edge and counts, in hardware, how long
-the comparator takes to go high (td). Pressing raises C, so td gets longer.
-At startup the untouched td is measured (don't touch the pad), and a press is
-any td longer than baseline + THRESH_OFFSET_US for a few cycles in a row.
+the comparator takes to go high (td). On this build a touch pulls td DOWN
+(untouched ~33 us, touched ~16-28 us), so td below TOUCH_BELOW_US for a few
+cycles in a row = touched.
 """
 
 import rp2
@@ -22,8 +22,7 @@ SENSE_PIN = 21          # comparator output in
 F_SM = 50_000_000       # PIO clock: one count loop = 2 cycles = 0.04 us
 HALF_US = 1000          # half-period -> ~500 Hz (a hard press needs 3RC ~ 950 us)
 TIMEOUT_US = 800        # give up if the comparator never switches
-CAL_CYCLES = 200        # untouched cycles averaged for the baseline
-THRESH_OFFSET_US = 11.5 # threshold = baseline + half the smallest-press shift (~23 us)
+TOUCH_BELOW_US = 30.0   # td below this = touched
 DEBOUNCE = 5            # cycles in a row needed to change state
 REPORT_MS = 500         # print average td this often
 
@@ -68,16 +67,10 @@ def main():
     for _ in range(20):       # a few warm-up cycles
         measure_td_us()
 
-    print("Calibrating -- don't touch the pad...")
-    vals = [t for t in (measure_td_us() for _ in range(CAL_CYCLES)) if t is not None]
-    if not vals:
-        print("No comparator edges seen. Check wiring, pull-up and power.")
-        return
-    baseline = sum(vals) / len(vals)
-    thresh = baseline + THRESH_OFFSET_US
-    print("Baseline td = {:.2f} us, threshold = {:.2f} us".format(baseline, thresh))
+    print("Touched = td below {:.1f} us".format(TOUCH_BELOW_US))
 
-    pressed = False
+    touched = False          # debounced state
+    touched_in_window = False
     streak = 0
     total = n = 0
     last = time.ticks_ms()
@@ -89,19 +82,23 @@ def main():
         total += td
         n += 1
 
-        is_long = td > thresh
-        if is_long != pressed:
+        is_touch = td < TOUCH_BELOW_US
+        if is_touch != touched:
             streak += 1
             if streak >= DEBOUNCE:
-                pressed = is_long
+                touched = is_touch
                 streak = 0
-                print(">>> PRESS" if pressed else ">>> RELEASE")
+                print(">>> TOUCHED" if touched else ">>> RELEASED")
         else:
             streak = 0
+        if touched:
+            touched_in_window = True
 
         if time.ticks_diff(time.ticks_ms(), last) >= REPORT_MS:
-            print("td = {:6.2f} us  ({})".format(total / n, "PRESSED" if pressed else "untouched"))
+            print("td = {:6.2f} us  ({})".format(
+                total / n, "TOUCHED" if touched_in_window else "untouched"))
             total = n = 0
+            touched_in_window = touched
             last = time.ticks_ms()
 
 
