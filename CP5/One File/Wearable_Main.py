@@ -18,6 +18,15 @@ Step 3: LSM6DSO accelerometer added (from Accel_BMP280.py), read at
         25 Hz on the same I2C bus as the BMP280.
 Step 4: Capacitive press sensor added (from Cap_Press.py), read 10 times a
         second so its ~1 ms measurement does not stall the 4 ms loop.
+Step 5: Bluetooth (BLE) streaming to the computer (needs ble_uart.py on the
+        Pico, and Wearable_Receiver.py on the computer). USB printing still
+        works as before, so Thonny can be used for debugging.
+
+Bluetooth messages (one line each, comma separated):
+    W,<ppg>,<ecg>       wave point, 25 per second (12-bit counts)
+    S,<14 fields>       status every 2 s, fields in STATUS_FIELDS order
+    E,TOUCHED / E,RELEASED   press sensor event, sent the moment it happens
+An empty field means "no reading yet".
 
 Analog mux: PPG + thermistor on ONE ADC (GP26), selected by GP17.
 
@@ -46,6 +55,7 @@ Wiring (unchanged from your three scripts):
 """
 
 from machine import ADC, Pin, I2C
+import ble_uart
 import bme280
 import lsm6dsox
 import rp2
@@ -100,7 +110,7 @@ PRESS_MS         = 100        # measure td every 100 ms (10 Hz)
 F_SM             = 50_000_000 # PIO clock: one count loop = 2 cycles = 0.04 us
 HALF_US          = 1000       # high half of the square wave
 TIMEOUT_US       = 800        # give up if the comparator never switches
-TOUCH_ABOVE_US   = 220.0      # td above this = touched (measured: ~195 us
+TOUCH_ABOVE_US   = 300.0      # td above this = touched (measured: ~195 us
                               # untouched, ~245-290 us touched)
 RELEASE_BELOW_US = 210.0      # td below this = released. The gap between the
                               # two thresholds (hysteresis) stops flicker while
@@ -116,6 +126,14 @@ SHOW_WAVE    = False   # True = print wave samples for the Plotter, no text
 WAVE_SOURCE  = "ppg"   # which wave SHOW_WAVE plots: "ppg", "ecg" or
                        # "ecg_slope" (what the ECG beat detector sees)
 PLOT_EVERY   = 10      # plot 1 of every 10 samples (25 points/s)
+BLE_ENABLED  = True    # False = USB only, no Bluetooth
+BLE_NAME     = "Wearable"   # name the computer looks for
+
+# order of the fields in each Bluetooth status ("S") line
+STATUS_FIELDS = ("ecg_bpm", "ecg_off", "ppg_bpm_raw", "ppg_bpm_kf",
+                 "therm_raw_c", "therm_kf_c", "bmp_c", "diff_c",
+                 "touched", "td_avg_us", "accel_x_g", "accel_y_g",
+                 "accel_z_g", "loop_max_ms")
 
 # ---------------------------------------------------------------------------
 # Thermistor calibration (from KalmanFilter_Thermistor_BMP.py)
@@ -350,11 +368,21 @@ def fmt(c):
     return "{:6.2f}C/{:6.2f}F".format(c, c_to_f(c))
 
 
+def field(value, spec="{:.2f}"):
+    """One status field for Bluetooth: formatted number, or '' if None."""
+    return "" if value is None else spec.format(value)
+
+
 def main():
     print("T(C) = {:.4f} * V + {:.4f}".format(SLOPE, INTERCEPT))
     print("GP17 HIGH = PPG, LOW = thermistor ({} ms low once per {} ms)".format(
         2 * SETTLE_MS, TEMP_MS))
     print("ECG raw | PPG raw/KF | Therm raw | Therm KF | BMP280 | Diff (KF - BMP)")
+
+    ble = None
+    if BLE_ENABLED:
+        ble = ble_uart.BLEUART(BLE_NAME)
+        print("Bluetooth: advertising as '{}'".format(BLE_NAME))
 
     ppg_beats = BeatDetector(read_ppg())
     ecg_beats = BeatDetector(0, decay=ECG_DECAY, min_swing=ECG_MIN_SLOPE,
@@ -379,7 +407,7 @@ def main():
     last_press = now
     last_report = now
     blank_until = now
-    total = count = 0
+    ppg_total = ecg_total = slope_total = count = 0   # wave point averages
     hist = []
     worst_us = 0                        # longest loop pass since last report
 
@@ -407,17 +435,24 @@ def main():
                 ecg_hist.pop(0)
             ecg_slope = max(0, ecg_hist[-1] - ecg_hist[0])
 
-        if SHOW_WAVE:
-            if WAVE_SOURCE == "ecg":
-                total += 0 if ecg_sample is None else ecg_sample
-            elif WAVE_SOURCE == "ecg_slope":
-                total += ecg_slope
-            else:
-                total += sample
-            count += 1
-            if count == PLOT_EVERY:
-                print(total // count)
-                total = count = 0
+        # ---- wave points: average PLOT_EVERY samples -> 25 points/s ----
+        ppg_total += sample
+        ecg_total += 0 if ecg_sample is None else ecg_sample
+        slope_total += ecg_slope
+        count += 1
+        if count == PLOT_EVERY:
+            ppg_pt = ppg_total // count
+            ecg_pt = ecg_total // count
+            if SHOW_WAVE:                   # USB, for Thonny's Plotter
+                if WAVE_SOURCE == "ecg":
+                    print(ecg_pt)
+                elif WAVE_SOURCE == "ecg_slope":
+                    print(slope_total // count)
+                else:
+                    print(ppg_pt)
+            if ble:                         # Bluetooth: both waves
+                ble.send("W,{},{}".format(ppg_pt, ecg_pt))
+            ppg_total = ecg_total = slope_total = count = 0
 
         # ---- PPG beat detection (skipped right after a mux switch) ----
         if time.ticks_diff(now, blank_until) >= 0:
@@ -438,8 +473,12 @@ def main():
             if td is not None:
                 td_total += td
                 td_n += 1
-                if touch.update(td) and not SHOW_WAVE:
-                    print(">>> TOUCHED" if touch.touched else ">>> RELEASED")
+                if touch.update(td):
+                    event = "TOUCHED" if touch.touched else "RELEASED"
+                    if not SHOW_WAVE:
+                        print(">>> " + event)
+                    if ble:
+                        ble.send("E," + event)
             last_press = now
 
         # ---- LSM6DSO accel at 25 Hz ----
@@ -455,8 +494,8 @@ def main():
             last_temp = now
             blank_until = time.ticks_add(time.ticks_ms(), BLANK_MS)
 
-        # ---- BPM + combined print every 2 s ----
-        if not SHOW_WAVE and time.ticks_diff(now, last_report) >= REPORT_MS:
+        # ---- BPM + combined report every 2 s (USB text + Bluetooth) ----
+        if time.ticks_diff(now, last_report) >= REPORT_MS:
             # ECG heart rate (raw -- no Kalman filter yet)
             ecg_bpm = ecg_beats.bpm(now)
             if ecg_off:
@@ -468,6 +507,7 @@ def main():
 
             # PPG heart rate (raw / Kalman)
             bpm_raw = ppg_beats.bpm(now)
+            bpm_kf = None
             if bpm_raw is not None:
                 bpm_kf = kf_bpm.update(bpm_raw)
                 ppg = "PPG {:3d}/{:3d} BPM".format(round(bpm_raw), round(bpm_kf))
@@ -475,32 +515,52 @@ def main():
                 ppg = "PPG  --/ -- BPM"
 
             hr = ecg + " | " + ppg
+            diff_c = None if therm_raw is None else therm_kf - bmp_c
+            td_avg = td_total / td_n if td_n else None
+            ax, ay, az = accel if accel is not None else (None, None, None)
 
-            if therm_raw is not None:
-                diff_c = therm_kf - bmp_c
-                print("{} | Therm {} | KF {} | BMP {} | Diff {:+5.2f}C/{:+5.2f}F".format(
-                    hr, fmt(therm_raw), fmt(therm_kf), fmt(bmp_c),
-                    diff_c, diff_c * 9 / 5))
-            else:
-                print(hr)
+            if not SHOW_WAVE:                # USB text (Thonny Shell)
+                if therm_raw is not None:
+                    print("{} | Therm {} | KF {} | BMP {} | Diff {:+5.2f}C/{:+5.2f}F".format(
+                        hr, fmt(therm_raw), fmt(therm_kf), fmt(bmp_c),
+                        diff_c, diff_c * 9 / 5))
+                else:
+                    print(hr)
 
-            # press sensor: current state + average td over the last 2 s
-            if td_n:
-                print("    Press {} (td avg {:6.1f} us)".format(
-                    "TOUCHED  " if touch.touched else "untouched", td_total / td_n))
-            else:
-                print("    Press -- (no reading: comparator timed out)")
+                # press sensor: current state + average td over the last 2 s
+                if td_avg is not None:
+                    print("    Press {} (td avg {:6.1f} us)".format(
+                        "TOUCHED  " if touch.touched else "untouched", td_avg))
+                else:
+                    print("    Press -- (no reading: comparator timed out)")
+
+                # LSM6DSO: latest reading, on its own line
+                if accel is not None:
+                    print("    Accel X {:+6.2f} Y {:+6.2f} Z {:+6.2f} g".format(ax, ay, az))
+                # longest pass in the last 2 s (budget is SAMPLE_MS = 4 ms; the
+                # once-per-second thermistor + BMP280 pass is expected to be longer)
+                print("    Loop max {:5.1f} ms".format(worst_us / 1000))
+                if ble:
+                    print("    Bluetooth {}".format(
+                        "connected" if ble.is_connected() else "waiting for computer"))
+
+            if ble:                          # Bluetooth status line
+                ble.send(",".join((
+                    "S",
+                    field(ecg_bpm, "{:.0f}"), ecg_off or "",
+                    field(bpm_raw, "{:.0f}"), field(bpm_kf, "{:.0f}"),
+                    field(therm_raw), field(therm_kf), field(bmp_c), field(diff_c),
+                    "1" if touch.touched else "0", field(td_avg, "{:.1f}"),
+                    field(ax), field(ay), field(az),
+                    field(worst_us / 1000, "{:.1f}"))))
+
             td_total = td_n = 0
-
-            # LSM6DSO: latest reading, on its own line
-            if accel is not None:
-                print("    Accel X {:+6.2f} Y {:+6.2f} Z {:+6.2f} g".format(
-                    accel[0], accel[1], accel[2]))
-            # longest pass in the last 2 s (budget is SAMPLE_MS = 4 ms; the
-            # once-per-second thermistor + BMP280 pass is expected to be longer)
-            print("    Loop max {:5.1f} ms".format(worst_us / 1000))
             worst_us = 0
             last_report = now
+
+        # ---- Bluetooth: send one queued packet per pass ----
+        if ble:
+            ble.flush()
 
         # ---- loop timing check ----
         worst_us = max(worst_us, time.ticks_diff(time.ticks_us(), loop_start))
@@ -545,4 +605,3 @@ finally:
 # skin temperature changes far slower than once per second, and the PPG
 # loses only 2 ms out of every 1000 ms.
 # ---------------------------------------------------------------------------
-
