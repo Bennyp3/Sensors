@@ -9,12 +9,15 @@ Every sensor is its own subfunction that returns that sensor's value:
     read_ecg()         -> one ECG sample, 12-bit counts, or None if a lead is off
     ecg_leads_off()    -> which ECG electrode is off, or None if both are on
     read_accel()       -> LSM6DSO acceleration (x, y, z) in g
+    read_press_td()    -> press sensor charge time td in us, or None on timeout
 
 Step 1: Analog_MUX.py (PPG + thermistor + BMP280) split into subfunctions.
 Step 2: AD8232 ECG added (from AD8232.py). ECG BPM is raw for now -- no
         Kalman filter yet. R peaks are found by slope.
 Step 3: LSM6DSO accelerometer added (from Accel_BMP280.py), read at
         25 Hz on the same I2C bus as the BMP280.
+Step 4: Capacitive press sensor added (from Cap_Press.py), read 10 times a
+        second so its ~1 ms measurement does not stall the 4 ms loop.
 
 Analog mux: PPG + thermistor on ONE ADC (GP26), selected by GP17.
 
@@ -38,11 +41,14 @@ Wiring (unchanged from your three scripts):
     GP27 (ADC1, pin 32) <- AD8232 OUTPUT (ECG)
     GP14 (pin 19)       <- AD8232 LO+  (high = electrode off)
     GP15 (pin 20)       <- AD8232 LO-  (high = electrode off)
+    GP20 (pin 26)       -> R2 -> press sensor C (square wave out, PIO)
+    GP21 (pin 27)       <- LM339 comparator output (press sensor)
 """
 
 from machine import ADC, Pin, I2C
 import bme280
 import lsm6dsox
+import rp2
 import time
 
 # ---------------------------------------------------------------------------
@@ -63,6 +69,9 @@ imu = lsm6dsox.LSM6DSOX(i2c, gyro_odr=0)   # accel 104 Hz, +/-4 g; gyro off
 ecg_adc  = ADC(Pin(27))            # GP27 = ADC1 = AD8232 OUTPUT
 lo_plus  = Pin(14, Pin.IN)         # GP14 = AD8232 LO+
 lo_minus = Pin(15, Pin.IN)         # GP15 = AD8232 LO-
+
+PRESS_DRIVE_PIN = 20               # GP20 = square wave out to R2
+PRESS_SENSE_PIN = 21               # GP21 = comparator output in
 
 # ---------------------------------------------------------------------------
 # Timing
@@ -85,6 +94,21 @@ ECG_SLOPE_LAG     = 4     # slope = sample now - sample 4 ago (16 ms)
 ECG_MIN_SLOPE     = 40    # slope swing needed to count as a beat (counts)
 ECG_DECAY         = 0.25  # envelope relaxes 0.25 count/sample (~60 counts/s)
 ECG_REFRACTORY_MS = 350   # ignore beats closer than 350 ms (>171 BPM)
+
+# ---- capacitive press sensor (from Cap_Press.py) ----
+PRESS_MS         = 100        # measure td every 100 ms (10 Hz)
+F_SM             = 50_000_000 # PIO clock: one count loop = 2 cycles = 0.04 us
+HALF_US          = 1000       # high half of the square wave
+TIMEOUT_US       = 800        # give up if the comparator never switches
+TOUCH_ABOVE_US   = 220.0      # td above this = touched (measured: ~195 us
+                              # untouched, ~245-290 us touched)
+RELEASE_BELOW_US = 210.0      # td below this = released. The gap between the
+                              # two thresholds (hysteresis) stops flicker while
+                              # a finger lifts off. Set to 220.0 = old behaviour
+DEBOUNCE         = 5          # readings in a row to change state (5 x 100 ms)
+
+US_PER_COUNT = 2 / F_SM * 1e6
+TIMEOUT = int(TIMEOUT_US / US_PER_COUNT)
 
 # ---- debug switches ----
 TEMP_ENABLED = True    # False = never switch the mux (pure PPG test)
@@ -200,6 +224,70 @@ def read_accel():
     return imu.accel()
 
 
+# ---------------------------------------------------------------------------
+# Capacitive press sensor -- PIO program unchanged from Cap_Press.py.
+# The PIO makes the rising edge and counts, in hardware, how long the
+# comparator takes to go high (td). A press raises C, so td goes UP.
+# ---------------------------------------------------------------------------
+@rp2.asm_pio(set_init=rp2.PIO.OUT_LOW)
+def cap_delay():
+    pull(block)               # CPU sends timeout count = "start a cycle"
+    mov(x, osr)
+    set(pins, 1)              # rising edge into the RC
+    label("wait")
+    jmp(pin, "done")          # comparator output high -> stop counting
+    jmp(x_dec, "wait")        # otherwise count down and check again
+    label("done")
+    mov(isr, x)
+    push(block)               # send remaining count back to the CPU
+    pull(block)               # CPU says "go low"
+    set(pins, 0)              # falling edge: capacitor discharges
+
+
+press_sense = Pin(PRESS_SENSE_PIN, Pin.IN)
+sm = rp2.StateMachine(0, cap_delay, freq=F_SM,
+                      set_base=Pin(PRESS_DRIVE_PIN), jmp_pin=press_sense)
+
+
+def read_press_td():
+    """Press sensor: return td in us, or None if the comparator timed out.
+
+    Same as measure_td_us() in Cap_Press.py, except it does not wait out the
+    1 ms low half: it is only called every PRESS_MS (100 ms), so the
+    capacitor has plenty of time to discharge before the next call. That
+    keeps this call to about 1 ms inside the 4 ms loop."""
+    sm.put(TIMEOUT)
+    x = sm.get()
+    time.sleep_us(HALF_US)    # rest of the high half
+    sm.put(0)                 # drive low: capacitor discharges until next call
+    if x == 0xFFFFFFFF:       # counter ran out: comparator never switched
+        return None
+    return (TIMEOUT - x) * US_PER_COUNT
+
+
+class TouchDetector:
+    """Debounced touched/untouched state from td readings, with hysteresis."""
+    def __init__(self):
+        self.touched = False
+        self.streak = 0
+
+    def update(self, td):
+        """Feed one td reading. Returns True when the state just changed."""
+        if self.touched:
+            wants_change = td < RELEASE_BELOW_US
+        else:
+            wants_change = td > TOUCH_ABOVE_US
+        if not wants_change:
+            self.streak = 0
+            return False
+        self.streak += 1
+        if self.streak < DEBOUNCE:
+            return False
+        self.touched = not self.touched
+        self.streak = 0
+        return True
+
+
 
 def read_ecg():
     """AD8232: return one 12-bit ECG sample (0-4095), or None if a lead is off."""
@@ -277,10 +365,18 @@ def main():
     therm_raw = therm_kf = bmp_c = None
     accel = None                        # latest LSM6DSO reading
 
+    sm.active(1)                        # start the press-sensor PIO
+    for _ in range(20):                 # a few warm-up cycles (Cap_Press.py)
+        read_press_td()
+        time.sleep_us(HALF_US)          # full low half during warm-up
+    touch = TouchDetector()
+    td_total = td_n = 0                 # for the average td in each report
+
     now = time.ticks_ms()
     next_sample = now
     last_temp = time.ticks_add(now, -TEMP_MS)   # read temps right away
     last_imu = now
+    last_press = now
     last_report = now
     blank_until = now
     total = count = 0
@@ -335,6 +431,17 @@ def main():
             ecg_off = None
             ecg_beats.update(ecg_slope, now)
 
+        # ---- press sensor at 10 Hz (skipped on the slow temperature pass) ----
+        if (time.ticks_diff(now, last_press) >= PRESS_MS
+                and time.ticks_diff(now, last_temp) < TEMP_MS):
+            td = read_press_td()
+            if td is not None:
+                td_total += td
+                td_n += 1
+                if touch.update(td) and not SHOW_WAVE:
+                    print(">>> TOUCHED" if touch.touched else ">>> RELEASED")
+            last_press = now
+
         # ---- LSM6DSO accel at 25 Hz ----
         if time.ticks_diff(now, last_imu) >= IMU_MS:
             accel = read_accel()
@@ -377,6 +484,14 @@ def main():
             else:
                 print(hr)
 
+            # press sensor: current state + average td over the last 2 s
+            if td_n:
+                print("    Press {} (td avg {:6.1f} us)".format(
+                    "TOUCHED  " if touch.touched else "untouched", td_total / td_n))
+            else:
+                print("    Press -- (no reading: comparator timed out)")
+            td_total = td_n = 0
+
             # LSM6DSO: latest reading, on its own line
             if accel is not None:
                 print("    Accel X {:+6.2f} Y {:+6.2f} Z {:+6.2f} g".format(
@@ -404,6 +519,9 @@ try:
 finally:
     sel.value(PPG)     # leave GP17 HIGH, same as PulseWave.py's IDLE_LEVEL = 1
     print("Stopped. GP17 = 1 (PPG channel)")
+    sm.active(0)
+    Pin(PRESS_DRIVE_PIN, Pin.OUT, value=0)   # stop the square wave, pin low
+    print("GP{} = 0 V (press sensor off)".format(PRESS_DRIVE_PIN))
 
 
 # ---------------------------------------------------------------------------
@@ -427,3 +545,4 @@ finally:
 # skin temperature changes far slower than once per second, and the PPG
 # loses only 2 ms out of every 1000 ms.
 # ---------------------------------------------------------------------------
+
