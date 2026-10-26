@@ -112,7 +112,7 @@ HALF_US          = 1000       # high half of the square wave
 TIMEOUT_US       = 800        # give up if the comparator never switches
 TOUCH_ABOVE_US   = 300.0      # td above this = touched (measured: ~195 us
                               # untouched, ~245-290 us touched)
-RELEASE_BELOW_US = 280.0      # td below this = released. The gap between the
+RELEASE_BELOW_US = 300.0      # td below this = released. The gap between the
                               # two thresholds (hysteresis) stops flicker while
                               # a finger lifts off. Set to 220.0 = old behaviour
 DEBOUNCE         = 5          # readings in a row to change state (5 x 100 ms)
